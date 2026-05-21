@@ -83,11 +83,12 @@ auto parse_and_compile(std::string_view source, session ctx)
 /// Run a closed pipeline from a list of operators.
 auto run_plan(OperatorChain<void, void> chain, caf::actor_system& sys,
               DiagHandler& dh, Profiler profiler, bool has_terminal,
-              bool is_hidden) -> Task<failure_or<void>>;
+              bool is_hidden, Notify* graceful_stop = nullptr)
+  -> Task<failure_or<void>>;
 
 auto run_plan(OperatorChain<void, void> chain, caf::actor_system& sys,
-              DiagHandler& dh, Profiler profiler, bool is_hidden)
-  -> Task<failure_or<void>>;
+              DiagHandler& dh, Profiler profiler, bool is_hidden,
+              Notify* graceful_stop = nullptr) -> Task<failure_or<void>>;
 
 /// Run a `table_slice -> table_slice` chain over a fixed input vector.
 ///

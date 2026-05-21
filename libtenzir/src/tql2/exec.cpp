@@ -2054,14 +2054,14 @@ auto run_profiler(Profiler const& profiler, TestExecCtx& exec_ctx,
 
 auto run_plan(OperatorChain<void, void> chain, caf::actor_system& sys,
               DiagHandler& dh, Profiler profiler, bool has_terminal,
-              bool is_hidden) -> Task<failure_or<void>> {
+              bool is_hidden, Notify* graceful_stop) -> Task<failure_or<void>> {
   auto num_ops = chain.size();
   LOGW("spawning plan with {} operators", num_ops);
   auto exec_ctx = TestExecCtx{profiler, has_terminal, is_hidden};
   co_await async_scope([&](AsyncScope& scope) -> Task<void> {
     scope.spawn(run_profiler(profiler, exec_ctx, num_ops));
     LOGW("blocking on pipeline");
-    co_await run_pipeline(std::move(chain), exec_ctx, sys, dh);
+    co_await run_pipeline(std::move(chain), exec_ctx, sys, dh, graceful_stop);
     LOGW("blocking on pipeline done");
     scope.cancel();
   });
@@ -2069,10 +2069,10 @@ auto run_plan(OperatorChain<void, void> chain, caf::actor_system& sys,
 }
 
 auto run_plan(OperatorChain<void, void> chain, caf::actor_system& sys,
-              DiagHandler& dh, Profiler profiler, bool is_hidden)
-  -> Task<failure_or<void>> {
+              DiagHandler& dh, Profiler profiler, bool is_hidden,
+              Notify* graceful_stop) -> Task<failure_or<void>> {
   co_return co_await run_plan(std::move(chain), sys, dh, std::move(profiler),
-                              false, is_hidden);
+                              false, is_hidden, graceful_stop);
 }
 
 auto run_transform(std::vector<table_slice> input,

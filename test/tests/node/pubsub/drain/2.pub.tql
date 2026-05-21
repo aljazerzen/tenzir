@@ -1,0 +1,6 @@
+// neo
+every 10ms {
+  from {id: "drain"}
+}
+head 5
+publish "drain"

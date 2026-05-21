@@ -1,0 +1,3 @@
+suite:
+  name: pubsub-drain
+  mode: parallel
