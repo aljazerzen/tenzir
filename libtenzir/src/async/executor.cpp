@@ -14,6 +14,7 @@
 #include "tenzir/async/log.hpp"
 #include "tenzir/async/mail.hpp"
 #include "tenzir/async/select_set.hpp"
+#include "tenzir/async_secret_resolution.hpp"
 #include "tenzir/co_match.hpp"
 #include "tenzir/ir.hpp"
 #include "tenzir/option.hpp"
@@ -22,6 +23,8 @@
 
 #include <folly/Demangle.h>
 #include <folly/coro/BoundedQueue.h>
+
+#include <mutex>
 
 // TODO: Why does this not report line numbers correctly?
 #undef TENZIR_UNREACHABLE
@@ -37,6 +40,30 @@ auto global_registry() -> std::shared_ptr<const registry>;
 namespace {
 
 auto demangle_op_type(std::type_info const& type) -> std::string;
+
+auto run_secret_cache_cleanup() -> Task<void> {
+  while (true) {
+    auto wait = duration{};
+    {
+      auto cache = co_await SecretCache::instance().unique_lock();
+      wait = cache->cleanup();
+    }
+    co_await sleep_for(wait);
+  }
+}
+
+auto start_secret_cache_cleanup_task() -> void {
+  static auto once = std::once_flag{};
+  std::call_once(once, [] {
+    folly::coro::co_withExecutor(folly::getGlobalCPUExecutor(),
+                                 run_secret_cache_cleanup())
+      .start([](auto&& result) {
+        if (result.hasException()) {
+          std::terminate();
+        }
+      });
+  });
+}
 
 } // namespace
 
@@ -607,6 +634,7 @@ private:
 
   auto resolve_secrets(std::vector<secret_request> requests)
     -> Task<failure_or<void>> override {
+    start_secret_cache_cleanup_task();
     // All secrets that must be resolved by the node/platform.
     auto requested_secrets = request_map_t();
     // The finishers (operations) that must be performed after the value is known.
@@ -650,61 +678,88 @@ private:
       }
       co_return {};
     }
-    auto node = co_await fetch_node(sys_, *dh_);
-    if (not node or not *node) {
-      co_return failure::promise();
-    }
-    // All futures for requests we send to the node
-    auto tasks = std::vector<Task<caf::expected<secret_resolution_result>>>{};
-    // Key pairs used for the request encryption per request
-    auto keys = std::vector<ecc::string_keypair>{};
-    for (auto& [name, out] : requested_secrets) {
-      auto key_pair = ecc::generate_keypair();
-      TENZIR_ASSERT(key_pair);
-      auto public_key = key_pair->public_key;
-      tasks.push_back(
-        async_mail(atom::resolve_v, name, public_key).request(*node));
-      keys.push_back(std::move(*key_pair));
-    }
-    const auto results
-      = co_await folly::coro::collectAllRange(std::move(tasks));
-    // We use a bool here to be able to validate all secrets instead of early
-    // exiting.
-    auto success = true;
-    for (auto&& [expected, key, secret] :
-         std::views::zip(results, std::as_const(keys), requested_secrets)) {
-      auto& [name, out] = secret;
-      if (not expected) {
-        diagnostic::error(expected.error())
-          .primary(out.loc, "secret `{}` failed", name)
-          .emit(dh_);
-        success = false;
+    auto all_cached = true;
+    auto cache = co_await SecretCache::instance().shared_lock();
+    for (auto& [k, v] : requested_secrets) {
+      if (auto s = cache->lookup(k)) {
+        v.value = *s;
         continue;
       }
-      match(
-        *expected,
-        [&](const encrypted_secret_value& v) {
-          auto decrypted = ecc::decrypt(v.value, key);
-          if (not decrypted) {
-            diagnostic::error("failed to decrypt secret: {}", decrypted.error())
-              .primary(out.loc, "secret `{}` failed", name)
-              .emit(dh_);
-            success = false;
-            return;
-          }
-          out.value = std::move(*decrypted);
-        },
-        [&](const secret_resolution_error& e) {
-          diagnostic::error("could not get secret value: {}", e.message)
+      all_cached = false;
+    }
+    cache.unlock();
+    if (not all_cached) {
+      auto node = co_await fetch_node(sys_, *dh_);
+      if (not node or not *node) {
+        co_return failure::promise();
+      }
+      // All futures for requests we send to the node
+      auto tasks = std::vector<Task<caf::expected<secret_resolution_result>>>{};
+      // Key pairs used for the request encryption per request
+      struct name_and_key {
+        std::string name;
+        ecc::string_keypair keys;
+      };
+      auto names_and_keys = std::vector<name_and_key>{};
+      for (auto& [name, out] : requested_secrets) {
+        // If the secret already has a value, it was found in the local cache.
+        // We still need to push an empty key pair so that the condition
+        // requested_secrets.size() == keys.size() holds.
+        if (not out.value.empty()) {
+          continue;
+        }
+        auto key_pair = ecc::generate_keypair();
+        TENZIR_ASSERT(key_pair);
+        auto public_key = key_pair->public_key;
+        tasks.push_back(
+          async_mail(atom::resolve_v, name, public_key).request(*node));
+        names_and_keys.emplace_back(name, std::move(*key_pair));
+      }
+      const auto results
+        = co_await folly::coro::collectAllRange(std::move(tasks));
+      // We use a bool here to be able to validate all secrets instead of early
+      // exiting.
+      auto success = true;
+      auto cache = co_await SecretCache::instance().unique_lock();
+      for (auto&& [expected, name_and_key] :
+           std::views::zip(results, names_and_keys)) {
+        auto& [name, key] = name_and_key;
+        auto& out = requested_secrets.at(name);
+        if (not expected) {
+          diagnostic::error(expected.error())
             .primary(out.loc, "secret `{}` failed", name)
             .emit(dh_);
           success = false;
-        });
-    }
-    if (not success) {
-      co_return failure::promise();
+          continue;
+        }
+        match(
+          *expected,
+          [&](const encrypted_secret_value& v) {
+            auto decrypted = ecc::decrypt(v.value, key);
+            if (not decrypted) {
+              diagnostic::error("failed to decrypt secret: {}",
+                                decrypted.error())
+                .primary(out.loc, "secret `{}` failed", name)
+                .emit(dh_);
+              success = false;
+              return;
+            }
+            cache->insert(name, *decrypted);
+            out.value = std::move(*decrypted);
+          },
+          [&](const secret_resolution_error& e) {
+            diagnostic::error("could not get secret value: {}", e.message)
+              .primary(out.loc, "secret `{}` failed", name)
+              .emit(dh_);
+            success = false;
+          });
+      }
+      if (not success) {
+        co_return failure::promise();
+      }
     }
     /// Finish all secrets via the respective finisher.
+    auto success = true;
     for (const auto& f : finishers) {
       success &= static_cast<bool>(f.finish(requested_secrets, censor_, *dh_));
     }
