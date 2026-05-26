@@ -15,6 +15,7 @@
 #include <tenzir/operator_plugin.hpp>
 #include <tenzir/pipeline_metrics.hpp>
 #include <tenzir/plugin/register.hpp>
+#include <tenzir/proxy_settings.hpp>
 #include <tenzir/tql2/plugin.hpp>
 #include <tenzir/variant.hpp>
 
@@ -271,6 +272,9 @@ public:
     });
     auto channel_args = grpc::ChannelArguments{};
     channel_args.SetSslTargetNameOverride("VelociraptorServer");
+    if (auto proxy = proxy_for_grpc_target(config->api_connection_string)) {
+      channel_args.SetString(GRPC_ARG_HTTP_PROXY, *proxy);
+    }
     auto channel = grpc::CreateCustomChannel(config->api_connection_string,
                                              credentials, channel_args);
     auto stub = proto::API::NewStub(channel);

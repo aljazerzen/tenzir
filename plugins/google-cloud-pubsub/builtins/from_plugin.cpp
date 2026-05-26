@@ -12,6 +12,8 @@
 #include <tenzir/async/notify.hpp>
 #include <tenzir/defaults.hpp>
 #include <tenzir/detail/scope_guard.hpp>
+#include "google_cloud_pubsub/proxy_options.hpp"
+
 #include <tenzir/operator_plugin.hpp>
 #include <tenzir/pipeline_metrics.hpp>
 #include <tenzir/plugin/register.hpp>
@@ -99,7 +101,8 @@ public:
     ();
     auto connection = pubsub::MakeSubscriberConnection(
       std::move(subscription),
-      google::cloud::Options{}.set<pubsub::MaxConcurrencyOption>(1));
+      with_proxy_options(
+        google::cloud::Options{}.set<pubsub::MaxConcurrencyOption>(1)));
     auto subscriber = pubsub::Subscriber(std::move(connection));
     // The pubsub library does not conclusively specify that only one callback
     // will be *executed* at a time. Hence we still have a mutex here to be safe.
@@ -288,7 +291,8 @@ public:
 
     auto connection = pubsub::MakeSubscriberConnection(
       std::move(subscription),
-      google::cloud::Options{}.set<pubsub::MaxConcurrencyOption>(1));
+      with_proxy_options(
+        google::cloud::Options{}.set<pubsub::MaxConcurrencyOption>(1)));
     auto subscriber = pubsub::Subscriber(std::move(connection));
 
     auto shared = shared_;

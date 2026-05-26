@@ -8,9 +8,12 @@
 
 #include <tenzir/async/result.hpp>
 #include <tenzir/detail/assert.hpp>
+#include <tenzir/detail/base64.hpp>
 #include <tenzir/http.hpp>
 #include <tenzir/http_pool.hpp>
+#include <tenzir/http_proxy_connect.hpp>
 #include <tenzir/logger.hpp>
+#include <tenzir/proxy_settings.hpp>
 
 #include <fmt/format.h>
 #include <folly/ScopeGuard.h>
@@ -181,13 +184,63 @@ HttpPool::HttpPool(folly::Executor::KeepAlive<folly::IOExecutor> executor,
   }
   auto pool_params = proxygen::coro::HTTPCoroSessionPool::PoolParams{};
   pool_params.connectTimeout = impl_->config.connection_timeout;
-  impl_->pool = SessionPoolPtr{
-    std::make_unique<proxygen::coro::HTTPCoroSessionPool>(
-      impl_->evb, impl_->url.getHost(), impl_->url.getPort(), pool_params,
-      conn_params, proxygen::coro::HTTPCoroConnector::defaultSessionParams(),
-      true)
-      .release(),
-  };
+  // When a proxy is configured and the target is not on the bypass
+  // list, chain through Proxygen's built-in proxyPool support: TCP
+  // connections to the proxy are pooled by `proxy_pool`, and the
+  // target pool reuses CONNECT-tunnelled sessions on top of them.
+  auto proxy = proxy_for_host(impl_->url.getHost());
+  if (proxy) {
+    auto const& ps = get_proxy_settings();
+    TENZIR_ASSERT(ps.proxy_host and ps.proxy_port and ps.proxy_scheme);
+    // TLS-wrap the connection to the proxy itself when the proxy
+    // URL uses `https://`. The CONNECT tunnel then carries the
+    // target's own TLS (when `conn_params` requests it).
+    auto proxy_secure
+      = *ps.proxy_scheme == "https"
+          ? proxygen::coro::HTTPClient::SecureTransportImpl::TLS
+          : proxygen::coro::HTTPClient::SecureTransportImpl::NONE;
+    if (proxy_secure == proxygen::coro::HTTPClient::SecureTransportImpl::TLS) {
+      http::ensure_default_ca_paths();
+    }
+    auto proxy_conn_params
+      = proxygen::coro::HTTPClient::getConnParams(proxy_secure, *ps.proxy_host);
+    auto proxy_pool = std::shared_ptr<proxygen::coro::HTTPCoroSessionPool>(
+      new proxygen::coro::HTTPCoroSessionPool(
+        impl_->evb, *ps.proxy_host, *ps.proxy_port, pool_params,
+        proxy_conn_params,
+        proxygen::coro::HTTPCoroConnector::defaultSessionParams(),
+        /*allowNameLookup=*/true),
+      SessionPoolDeleter{});
+    auto connect_headers = proxygen::coro::HTTPCoroConnector::ConnectHeaderMap{};
+    if (ps.proxy_username) {
+      // `arrow::util::Uri::username()`/`password()` already
+      // percent-decode the userinfo, so the values stored on
+      // `proxy_settings` are the raw bytes that RFC 7617 Basic auth
+      // expects pre-base64.
+      auto userinfo
+        = fmt::format("{}:{}", *ps.proxy_username,
+                      ps.proxy_password ? *ps.proxy_password : std::string{});
+      connect_headers.emplace("Proxy-Authorization",
+                              fmt::format("Basic {}",
+                                          detail::base64::encode(userinfo)));
+    }
+    impl_->pool = SessionPoolPtr{
+      std::make_unique<proxygen::coro::HTTPCoroSessionPool>(
+        impl_->evb, impl_->url.getHost(), impl_->url.getPort(),
+        std::move(proxy_pool), pool_params, conn_params,
+        proxygen::coro::HTTPCoroConnector::defaultSessionParams(),
+        /*observer=*/nullptr, std::move(connect_headers))
+        .release(),
+    };
+  } else {
+    impl_->pool = SessionPoolPtr{
+      std::make_unique<proxygen::coro::HTTPCoroSessionPool>(
+        impl_->evb, impl_->url.getHost(), impl_->url.getPort(), pool_params,
+        conn_params, proxygen::coro::HTTPCoroConnector::defaultSessionParams(),
+        true)
+        .release(),
+    };
+  }
 }
 
 auto HttpPool::make(folly::Executor::KeepAlive<folly::IOExecutor> executor,
@@ -481,9 +534,16 @@ auto http_request(folly::EventBase* evb, proxygen::HTTPMethod method,
         if (url_parsed.isSecure()) {
           http::ensure_default_ca_paths();
         }
-        auto* session = co_await proxygen::coro::HTTPClient::getHTTPSession(
+        auto secure = url_parsed.isSecure()
+                        ? proxygen::coro::HTTPClient::SecureTransportImpl::TLS
+                        : proxygen::coro::HTTPClient::SecureTransportImpl::NONE;
+        auto conn_params = proxygen::coro::HTTPClient::getConnParams(
+          secure, url_parsed.getHost());
+        auto sess_params
+          = proxygen::coro::HTTPClient::getSessionParams(timeout);
+        auto* session = co_await connect_session_via_proxy_if_configured(
           evb, url_parsed.getHost(), url_parsed.getPort(),
-          url_parsed.isSecure(), false, timeout, timeout);
+          std::move(conn_params), std::move(sess_params), timeout);
         auto holder = session->acquireKeepAlive();
         SCOPE_EXIT {
           if (auto* s = holder.get()) {

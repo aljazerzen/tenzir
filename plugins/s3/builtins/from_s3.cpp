@@ -15,6 +15,7 @@
 #include <tenzir/operator_plugin.hpp>
 #include <tenzir/pipeline.hpp>
 #include <tenzir/plugin/register.hpp>
+#include <tenzir/proxy_settings.hpp>
 #include <tenzir/scope_linked.hpp>
 #include <tenzir/secret_resolution.hpp>
 #include <tenzir/secret_resolution_utilities.hpp>
@@ -240,6 +241,7 @@ private:
 struct FromS3Args : FromArrowFsArgs {
   bool anonymous = false;
   Option<located<record>> aws_iam;
+  location operator_location = location::unknown;
 };
 
 class FromS3Operator final : public FromArrowFsOperator {
@@ -304,6 +306,24 @@ protected:
         }
       }
     }
+    // Apply the configured HTTP proxy unconditionally — `uri.host()`
+    // for an `s3://bucket/...` URL is the bucket name, not the actual
+    // S3 endpoint, so a `tenzir.no-proxy` host-match wouldn't reflect
+    // user intent. Users who need to bypass the proxy for some S3
+    // operations should leave `tenzir.http-proxy` unset.
+    if (auto const& ps = get_proxy_settings(); ps.http_proxy) {
+      auto proxy_opts
+        = arrow::fs::S3ProxyOptions::FromUri(*ps.http_proxy);
+      if (not proxy_opts.ok()) {
+        diagnostic::warning("`tenzir.http-proxy` is not usable for S3; "
+                            "running this operator without a proxy")
+          .primary(args_.operator_location)
+          .note("{}", proxy_opts.status().ToStringWithoutContextLines())
+          .emit(dh);
+      } else {
+        opts.proxy_options = proxy_opts.MoveValueUnsafe();
+      }
+    }
     auto fs_result = arrow::fs::S3FileSystem::Make(opts);
     if (not fs_result.ok()) {
       diagnostic::error("failed to create S3 filesystem")
@@ -330,6 +350,24 @@ protected:
       }
       config.scheme = options.scheme == "http" ? Aws::Http::Scheme::HTTP
                                                : Aws::Http::Scheme::HTTPS;
+      // Mirror the proxy that S3FileSystem was constructed with, so
+      // DeleteObject goes out the same way the rest of the filesystem
+      // does.
+      if (not options.proxy_options.host.empty()) {
+        config.proxyHost = options.proxy_options.host;
+        config.proxyPort = options.proxy_options.port > 0
+                             ? static_cast<unsigned>(options.proxy_options.port)
+                             : 0u;
+        config.proxyScheme = options.proxy_options.scheme == "https"
+                               ? Aws::Http::Scheme::HTTPS
+                               : Aws::Http::Scheme::HTTP;
+        if (not options.proxy_options.username.empty()) {
+          config.proxyUserName = options.proxy_options.username;
+        }
+        if (not options.proxy_options.password.empty()) {
+          config.proxyPassword = options.proxy_options.password;
+        }
+      }
       auto [bucket, key] = split_at_first_slash(path);
       auto client
         = Aws::S3::S3Client{options.credentials_provider, nullptr, config};
@@ -452,6 +490,7 @@ class from_s3 final : public operator_plugin2<from_s3_operator>,
 
   auto describe() const -> Description override {
     auto d = Describer<FromS3Args, FromS3Operator>{};
+    d.operator_location(&FromS3Args::operator_location);
     auto anon = d.named("anonymous", &FromS3Args::anonymous);
     auto aws_iam_arg = d.named("aws_iam", &FromS3Args::aws_iam);
     FromArrowFsArgs::describe_to(d, [=](DescribeCtx& ctx) {

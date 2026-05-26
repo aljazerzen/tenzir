@@ -10,6 +10,8 @@
 #include <tenzir/concepts.hpp>
 #include <tenzir/detail/scope_guard.hpp>
 #include <tenzir/location.hpp>
+#include "google_cloud_pubsub/proxy_options.hpp"
+
 #include <tenzir/operator_plugin.hpp>
 #include <tenzir/pipeline_metrics.hpp>
 #include <tenzir/plugin/register.hpp>
@@ -60,7 +62,8 @@ public:
     -> generator<std::monostate> {
     co_yield {};
     auto topic = pubsub::Topic(args_.project_id.inner, args_.topic_id.inner);
-    auto connection = pubsub::MakePublisherConnection(std::move(topic));
+    auto connection = pubsub::MakePublisherConnection(
+      std::move(topic), with_proxy_options(google::cloud::Options{}));
     auto publisher = pubsub::Publisher(std::move(connection));
     auto& dh = ctrl.diagnostics();
     constexpr auto timeout = std::chrono::seconds{30};
@@ -214,7 +217,8 @@ public:
                          MetricsDirection::write, MetricsVisibility::external_,
                          MetricsUnit::events);
     auto topic = pubsub::Topic(args_.project_id.inner, args_.topic_id.inner);
-    publisher_.emplace(pubsub::MakePublisherConnection(std::move(topic)));
+    publisher_.emplace(pubsub::MakePublisherConnection(
+      std::move(topic), with_proxy_options(google::cloud::Options{})));
     co_return;
   }
 
