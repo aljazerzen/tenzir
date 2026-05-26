@@ -186,6 +186,18 @@ public:
       diagnostic::error("expected void, got {}", input).primary(self_).emit(dh);
       return failure::promise();
     }
+    for (const auto& event : events_) {
+      auto null_dh = null_diagnostic_handler{};
+      if (auto val = const_eval(event, null_dh)) {
+        if (not is<record>(*val)) {
+          const auto t = type::infer(*val);
+          diagnostic::error("expected `record`")
+            .primary(event, "got `{}`", t ? t->kind() : type_kind{})
+            .emit(dh);
+          return failure::promise();
+        }
+      }
+    }
     return tag_v<table_slice>;
   }
 
