@@ -35,9 +35,11 @@ rec {
     runtime
     integration
     integration-container
-    (ps: with ps; [
-      boto3
-      boto3-stubs
-    ])
+    (
+      ps: with ps; [
+        boto3
+        boto3-stubs
+      ]
+    )
   ];
 }

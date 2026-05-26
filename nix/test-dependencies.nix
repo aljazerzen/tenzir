@@ -33,11 +33,11 @@ rec {
     ];
   };
 
-  pythonPkgsFn = (ps: [
-    ps.trustme
-    ps.pymysql
-    ps.pyzmq
-  ]);
+  pythonPkgsFn = ps: [
+      ps.trustme
+      ps.pymysql
+      ps.pyzmq
+    ];
 
   tenzir-integration-test-deps = [
     curl
