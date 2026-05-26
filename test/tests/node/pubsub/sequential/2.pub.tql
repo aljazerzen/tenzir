@@ -1,0 +1,6 @@
+// neo
+every 10ms {
+  from {id: "pub-a"}
+}
+head 5
+publish "sequential"

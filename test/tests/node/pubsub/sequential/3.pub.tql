@@ -1,0 +1,5 @@
+// neo
+from {id: "pub-b", ts: 2025-03-03T12:00:01}
+delay ts, start=2025-03-03T12:00:00, speed=1.0
+drop ts
+publish "sequential"

@@ -1,0 +1,5 @@
+// neo
+subscribe "sequential"
+deduplicate
+head 2
+sort
